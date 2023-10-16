@@ -1,0 +1,126 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, zlib
+
+n = 100
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.remote_host = None
+        self.remote_port = None
+
+        self.recieved = []
+        self.buffer = [] # includes tuple (block#, data)
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def stringToBinary(self, s):
+        b = ''.join(format(ord(i), '08b') for i in s)
+        return b
+    
+    # return 1 if the number of 1 bits is even or 0
+    # 0 otherwise
+    def parityOfBits(self, bits):
+        ones = 0
+
+        for bit in bits:
+            if bit == "1":
+                ones = ones + 1
+
+        if (ones % 2) == 0:
+            return 1
+        else:
+            return 0
+
+    # is given data in binary
+    # returns parity in 110 bit string
+    def parityOfData(self, data):
+        result = ""
+        temp = data
+
+        while len(temp) != 0:
+            bits = temp[0:(n-1)]
+            temp = temp[n:]
+            result = result + str(self.parityOfBits(bits))
+        
+        return result
+
+    def run(self):
+        last_printed_block = -1
+
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            added = False
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+
+                # Grab the remote host/port if we don't already have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+
+                # try to unserialize a packet; break if the packet is malformed
+                try:
+                    msg = json.loads(data.decode('utf-8'))
+                    seqN = msg["seqN"]
+                    data = msg["data"]
+                    resent = msg["resent"]
+                    parity_sent = msg["parity"]
+                except:
+                    break
+
+                binary_string = str(zlib.compress(self.stringToBinary(data).encode()))
+                parity_recv = self.parityOfData(binary_string)
+
+                # if a packet is new, parity of sent and received is the same,
+                # and the data is the expected length of a data message
+                if seqN not in self.recieved and parity_sent == parity_recv and len(data) == 1375:
+                    self.log("Received data message %s" % msg)
+                    self.recieved.append(seqN)
+
+                    t = (seqN, data)
+                    self.buffer.append(t)
+                    added = True
+                    
+                    # Always send back an ack
+                    self.send({ "seqN": seqN, "type": "ack" })
+
+                # reattempt an ack package being sent
+                elif resent == 1 and parity_sent == parity_recv and len(data) == 1375:
+                    self.send({ "seqN": seqN, "type": "ack" })
+
+            # ony execute on a new message being received+ack package sent
+            if added:
+                printed = True
+
+                while printed:
+                    printed = False
+                    for x in self.buffer:
+                        block_num = x[0]
+                        block_data = x[1]
+
+                        if block_num == (last_printed_block + 1):
+                            # Print out the data to stdout
+                            #print(msg["data"], end='', flush=True)
+                            print(block_data, end='', flush=True)
+                            last_printed_block = last_printed_block + 1
+                            self.buffer.remove(x)
+                            printed = True
+
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()

@@ -1,0 +1,183 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, zlib
+
+DATA_SIZE = 1375
+WINDOW_SIZE = 5     # window size increased to improve speed
+RTT = 1
+RECOMMENDED_ALPHA = 0.875
+n = 100
+
+class Sender:
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        #self.waiting = False
+        self.waiting = []
+        self.sent = []
+        self.rtt = None
+        self.rto = None
+        self.window = 1
+        self.thresh = 1
+
+    # return the time that has passed since sent
+    def getSample(self, time_sent):
+        return time.time() - time_sent
+
+    # recalculate the new rtt and rto; the rto has been aggressively
+    # recalculated to improve speed
+    def recalculate_rtt(self, sample):
+        if self.rtt == None:
+            self.rtt = sample
+        else:
+            old_rtt = self.rtt
+            self.rtt = (RECOMMENDED_ALPHA * old_rtt) + ((1 - RECOMMENDED_ALPHA)
+                    * sample)
+        self.rto = 1.75 * self.rtt
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+
+    # return true if packet has timed out
+    def secondPassed(self, time_sent):
+        if self.rto == None:
+            return (time.time() - time_sent > 1)
+        return (time.time() - time_sent > self.rto)
+    
+    # resend a list of messages
+    def resend(self, messages):
+        for msg in messages:
+            self.log("Sending message '%s'" % msg)
+            msg["resent"] = 1
+            self.send(msg)
+            t = (msg, time.time())
+            self.sent.append(t)
+    
+    def stringToBinary(self, s):
+        b = ''.join(format(ord(i), '08b') for i in s)
+        return b
+    
+    def parityOfBits(self, bits):
+        ones = 0
+
+        for bit in bits:
+            if bit == "1":
+                ones = ones + 1
+
+        if (ones % 2) == 0:
+            return 1
+        else:
+            return 0
+
+    # is given data in binary
+    # returns parity in 110 bit string
+    def parityOfData(self, data):
+        result = ""
+        temp = data
+
+        while len(temp) != 0:
+            bits = temp[0:(n-1)]
+            temp = temp[n:]
+            result = result + str(self.parityOfBits(bits))
+        
+        return result
+
+
+    def run(self):
+        seqN = 0
+        while True:
+
+            sockets = [self.socket, sys.stdin] if (len(self.waiting) < self.window) else [self.socket]
+
+            socks = select.select(sockets, [], [], 0.1)[0]
+            for conn in socks:
+                if conn == self.socket:
+                    k, addr = conn.recvfrom(65535)
+                    msg = k.decode('utf-8')
+                    
+                    # attempt to unserialize a JSON packet; break if failed
+                    try:
+                        msg_json = json.loads(msg)
+                        recv_seqN = msg_json["seqN"]
+                    except:
+                        break
+
+                    # if an expected packet is received
+                    if recv_seqN in self.waiting:
+                        # remove from waiting queue
+                        self.waiting.remove(recv_seqN)
+
+                        sample = None
+                        
+                        # remove syn packet from sent list and update sample
+                        for t in self.sent:
+                            if t[0]["seqN"] == recv_seqN:
+                                self.sent.remove(t)
+                                sample = self.getSample(t[1])
+
+                        self.log("Received message '%s'" % msg)
+                        print("recvSequence: " + str(recv_seqN))
+
+                        self.recalculate_rtt(sample)
+
+                        # increase the window size by an appropriate amount 
+                        if (self.window < self.thresh):
+                            self.window = self.window + self.window
+                        else:
+                            self.window = self.window + 1 #(1 / self.window)
+
+
+                elif conn == sys.stdin:
+                    data = sys.stdin.read(DATA_SIZE)
+
+                    # if there is no new data and all expected packets have
+                    # been received
+                    if len(data) == 0 and len(self.waiting) == 0:
+                        self.log("All done!")
+                        sys.exit(0)
+
+                    elif len(data) != 0:
+
+                        
+                        binary_string = str(zlib.compress(self.stringToBinary(data).encode()))
+                        parity = self.parityOfData(binary_string)
+                        msg = { "seqN": seqN, "type": "msg", "resent": 0, "parity": parity, "data": data}
+                        self.log("Sending message '%s'" % msg)
+                        self.send(msg)
+                        t = (msg, time.time())
+                        self.waiting.append(seqN)
+                        self.sent.append(t)
+                        seqN = seqN + 1
+            
+            dropped = []
+
+            for messages in self.sent:
+                if self.secondPassed(messages[1]):
+                    msg = messages[0]
+                    dropped.append(msg)
+                    self.sent.remove(messages)
+            
+
+            if (len(dropped) > 0):
+                self.thresh = self.window / 2
+                self.window = 4
+
+
+            self.resend(dropped)
+
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
